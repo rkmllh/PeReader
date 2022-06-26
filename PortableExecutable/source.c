@@ -3,6 +3,8 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <time.h>
+#include <assert.h>
+#include "Image.h"
 
 #ifdef __GNUC__
 #define IMAGE_DLLCHARACTERISTICS_GUARD_CF     0x4000     // Image supports Control Flow Guard.
@@ -15,27 +17,24 @@
 #define READONLY    const
 #define PROCEDURE   void
 
-#define OFFSET_YEAR(year)										\
+#define OFFSET_YEAR(year)                                               \
 	year += 0x0000076c
 
-#define MEMCOPY(src, dest, size)								\
+#define MEMCOPY(src, dest, size)                                        \
 	memcpy(src,dest,size)
 
-#define NTSIGNATURE(base)										\
-	((LPVOID)((BYTE*)base + ((IMAGE_DOS_HEADER*)base)->e_lfanew))
-
-#define IMAGEFILEHEADEROFFSET(base)								\
-	(LPVOID)(((BYTE*)NTSIGNATURE(base)) + SIZEOF(DWORD))
-
-#define IMAGEOPTIONALHEADEROFFSET(base)							\
-	(LPVOID)((BYTE*)IMAGEFILEHEADEROFFSET(base) + SIZEOF(IMAGE_FILE_HEADER))
-
-#define IMAGESECTIONHEADEROFFSET(base)							\
-	(LPVOID)((BYTE*)IMAGEOPTIONALHEADEROFFSET(base) + SIZEOF(IMAGE_OPTIONAL_HEADER))
+#define TIME(timestamp, msg)                                                                         \
+	time_t import_time = timestamp;                                                                  \
+	struct tm* tm_import_time = gmtime(&import_time);                                                \
+	printf("[+]%s: %02d-%02d-%02d at %02d:%02d:%02d\n",                                              \
+        msg,                                                                                         \
+		OFFSET_YEAR(tm_import_time->tm_year), tm_import_time->tm_mon + 1, tm_import_time->tm_mday,   \
+		tm_import_time->tm_hour + 1, tm_import_time->tm_min, tm_import_time->tm_sec                  \
+);
 
 /*
 *   IMAGE_IMPORT_DESCRIPTOR is Import Directory Table
-*   for import sections, here it starts import informations.
+*   for import sections, here start import informations.
 *	It resolves references imported by DLL's.
 */
 typedef IMAGE_IMPORT_DESCRIPTOR     IMPORT_DIRECTORY_TABLE;
@@ -50,6 +49,7 @@ PROCEDURE ImageSectionHeaders(READONLY IMAGE_SECTION_HEADER* image_section_heade
 /*Path to data directory*/
 PROCEDURE ExportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* image_optional_header);
 PROCEDURE ImportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* image_optional_header);
+PROCEDURE ResourcesLoaded(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* image_optional_header);
 
 /*Print and die*/
 STATIC INLINE PROCEDURE fatal(READONLY CHAR* what);
@@ -93,7 +93,7 @@ INT main(INT argc, CHAR** argv)
 
 	image_dos_header = (IMAGE_DOS_HEADER*)base;
 	ImageDosHeader(image_dos_header);
-	image_nt_headers = (IMAGE_NT_HEADERS*)NTSIGNATURE(base);
+	image_nt_headers = (IMAGE_NT_HEADERS*)IMAGENTHEADEROFFSET(base);
 	printf("\n\n[+]IMAGE_NT_HEADERS at 0x%llx\n", (DWORD64)image_nt_headers);
 	ImageNtHeaders(image_nt_headers);
 
@@ -111,6 +111,7 @@ INT main(INT argc, CHAR** argv)
 
 	ExportFunctions(base, image_optional_header);
 	ImportFunctions(base, image_optional_header);
+	ResourcesLoaded(base, image_optional_header);
 
 	ReleaseResources();
 	GlobalFree((HGLOBAL)image_name);
@@ -124,6 +125,15 @@ PROCEDURE GetBaseAddress(VOID** base, READONLY CHAR* file)
 	if (!(*base = GetModuleHandle(file)))
 		fatal("GetModuleHandle");
 }
+
+/*
+* (IMAGE only)
+* Every PE file begins with a small MS-DOS® executable
+* IMAGE_DOS_HEADER is structure that represent MS-DOS header.
+* The first bytes of a PE file begin with this header.
+* The e_lfanew field contains the file offset of the PE header.
+* The e_magic field needs to be set to the value 0x5A4D (MZ).
+*/
 
 PROCEDURE ImageDosHeader(READONLY IMAGE_DOS_HEADER* image_dos_header)
 {
@@ -152,8 +162,16 @@ PROCEDURE ImageDosHeader(READONLY IMAGE_DOS_HEADER* image_dos_header)
 	return;
 }
 
+/*
+* IMAGE_NT_HEADERS is taken by IMAGE_DOS_HEADER -> e_lfanew offset.
+* Here you can find signature of PE file.
+* In a valid PE file, the Signature field is set to the value 0x00004550,
+* which in ASCII is "\P\E\0\0"
+*/
+
 PROCEDURE ImageNtHeaders(READONLY IMAGE_NT_HEADERS* image_nt_header)
 {
+	READONLY VOID* nt_signature = image_nt_header;
 	printf("[+]Signature: ");
 
 	switch (LOWORD(*(DWORD*)image_nt_header))
@@ -176,10 +194,17 @@ PROCEDURE ImageNtHeaders(READONLY IMAGE_NT_HEADERS* image_nt_header)
 		break;
 	}
 
-	printf(" 0x%x\n", LOWORD(*(DWORD*)image_nt_header));
+	printf(" 0x%x [%s]\n", LOWORD(*(DWORD*)nt_signature), (CHAR*)nt_signature);
 
 	return;
 }
+
+/*
+* IMAGE_FILE_HEADER is taken by IMAGE_NT_HEADERS -> FileHeader
+* Here you can find some information about file itself.
+* The most important field in this header is SizeOfOptionalHeader,
+* that describes size of IMAGE_OPTIONAL_HEADER.
+*/
 
 PROCEDURE ImageFileHeaders(READONLY IMAGE_FILE_HEADER* image_file_header)
 {
@@ -209,13 +234,8 @@ PROCEDURE ImageFileHeaders(READONLY IMAGE_FILE_HEADER* image_file_header)
 
 	printf("[+]Number of sections: 0x%x\n", image_file_header->NumberOfSections);
 
-	linked_time = image_file_header->TimeDateStamp;
-	tm_linked_time = gmtime(&linked_time);
 
-	printf("[+]Linked data: %02d-%02d-%02d at %02d:%02d:%02d\n",
-		OFFSET_YEAR(tm_linked_time->tm_year), tm_linked_time->tm_mon + 1, tm_linked_time->tm_mday,
-		tm_linked_time->tm_hour + 1, tm_linked_time->tm_min, tm_linked_time->tm_sec
-	);
+	TIME(image_file_header->TimeDateStamp, "Linked data");
 
 	printf("[+]Pointer to symbol table: 0x%llx\n", (DWORD64)image_file_header->PointerToSymbolTable);
 	printf("[+]Number of symbols: %d\n", image_file_header->NumberOfSymbols);
@@ -251,6 +271,14 @@ PROCEDURE ImageFileHeaders(READONLY IMAGE_FILE_HEADER* image_file_header)
 
 	return;
 }
+
+/*
+* IMAGE_OPTIONAL_HEADER is taken by IMAGE_NT_HEADERS -> OptionalHeader
+* Here you can find many informations.
+* Most important information is an array of directory.
+* Each directory contains special information about a specific section.
+* Please see DataDirectory field for more info
+*/
 
 PROCEDURE ImageOptionalHeaders(READONLY IMAGE_OPTIONAL_HEADER* image_optional_header)
 {
@@ -440,8 +468,6 @@ PROCEDURE ImageSectionHeaders(READONLY IMAGE_SECTION_HEADER* image_section_heade
 
 PROCEDURE ExportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* image_optional_header)
 {
-	time_t export_time = 0;
-	struct tm* tm_export_time = NULL;
 	IMAGE_DATA_DIRECTORY* image_data_directory = (IMAGE_DATA_DIRECTORY*)image_optional_header->DataDirectory;
 	IMAGE_EXPORT_DIRECTORY* image_export_directory = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)base + image_optional_header->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
@@ -450,8 +476,7 @@ PROCEDURE ExportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* 
 	PUSHORT ordinal_table_RVA = NULL;
 
 	DWORD i = 0;
-
-	/*Check number of directories*/
+	 
 	if (IMAGE_DIRECTORY_ENTRY_EXPORT < image_optional_header->NumberOfRvaAndSizes)
 	{
 		printf("\n  IMAGE_DIRECTORY_ENTRY_EXPORT\tSize\tVirtualAddress \n"
@@ -477,12 +502,7 @@ PROCEDURE ExportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* 
 			printf("[+]Number of functions: %d\n", image_export_directory->NumberOfFunctions);
 			printf("[+]Number of names: %d\n", image_export_directory->NumberOfNames);
 
-			export_time = image_export_directory->TimeDateStamp;
-			tm_export_time = gmtime(&export_time);
-			printf("[+]Creation data: %02d-%02d-%02d at %02d:%02d:%02d\n",
-				OFFSET_YEAR(tm_export_time->tm_year), tm_export_time->tm_mon + 1, tm_export_time->tm_mday,
-				tm_export_time->tm_hour + 1, tm_export_time->tm_min, tm_export_time->tm_sec
-			);
+			TIME(image_export_directory->TimeDateStamp, "Creation data");
 
 			printf("Ordinal%10sAddress%10sName  \n%s%17s%17s", "", "",
 				"-------",
@@ -518,9 +538,6 @@ PROCEDURE ExportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* 
 
 PROCEDURE ImportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* image_optional_header)
 {
-	time_t import_time = 0;
-	struct tm* tm_import_time = NULL;
-
 	READONLY BYTE* dll_name = NULL;
 
 	IMAGE_DATA_DIRECTORY* image_data_directory = (IMAGE_DATA_DIRECTORY*)image_optional_header->DataDirectory;
@@ -540,7 +557,6 @@ PROCEDURE ImportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* 
 	*   Each directory entries describes a DLL.
 	*/
 
-	/*Check number of directories*/
 	if (IMAGE_DIRECTORY_ENTRY_IMPORT < image_optional_header->NumberOfRvaAndSizes)
 	{
 		printf("\n  IMAGE_DIRECTORY_ENTRY_IMPORT\tSize\tVirtualAddress \n"
@@ -555,13 +571,7 @@ PROCEDURE ImportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* 
 		{
 			while (import_directory_table->OriginalFirstThunk)
 			{
-				/*Retrieve time*/
-				import_time = import_directory_table->TimeDateStamp;
-				tm_import_time = gmtime(&import_time);
-				printf("[+]Creation data: %02d-%02d-%02d at %02d:%02d:%02d\n",
-					OFFSET_YEAR(tm_import_time->tm_year), tm_import_time->tm_mon + 1, tm_import_time->tm_mday,
-					tm_import_time->tm_hour + 1, tm_import_time->tm_min, tm_import_time->tm_sec
-				);
+				TIME(import_directory_table->TimeDateStamp, "Creation data");
 
 				dll_name = (BYTE*)base + import_directory_table->Name;
 
@@ -592,6 +602,37 @@ PROCEDURE ImportFunctions(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* 
 	}
 
 	return;
+}
+
+PROCEDURE ResourcesLoaded(READONLY LPVOID base, READONLY IMAGE_OPTIONAL_HEADER* image_optional_header)
+{
+	IMAGE_DATA_DIRECTORY* image_data_directory = (IMAGE_DATA_DIRECTORY*)image_optional_header->DataDirectory;
+	IMAGE_RESOURCE_DIRECTORY* import_resource_directory = (IMAGE_RESOURCE_DIRECTORY*)((BYTE*)base + image_optional_header->DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress);
+	IMAGE_RESOURCE_DATA_ENTRY* image_resource_data_entry = NULL;
+
+	INT32 size = import_resource_directory->NumberOfIdEntries + import_resource_directory->NumberOfNamedEntries;
+	IMAGE_RESOURCE_DIRECTORY* item = NULL;
+
+	if (IMAGE_DIRECTORY_ENTRY_RESOURCE < image_optional_header->NumberOfRvaAndSizes)
+	{
+		printf("\n  IMAGE_DIRECTORY_ENTRY_RESOURCE\tSize\tVirtualAddress \n"
+			"  ------------------------------\t----\t--------------\n"
+			"                                \t%#x \t%#x           \n\n",
+			image_data_directory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size,
+			image_data_directory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress
+		);
+
+		if (image_data_directory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress &&
+			image_data_directory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size)
+		{
+			printf("[+]Number of ID entries: %d\n", import_resource_directory->NumberOfIdEntries);
+			printf("[+]Number of named entries: %d\n", import_resource_directory->NumberOfNamedEntries);
+			
+			image_resource_data_entry = (IMAGE_RESOURCE_DATA_ENTRY*)(import_resource_directory);
+			((IMAGE_RESOURCE_DIRECTORY*)image_resource_data_entry)++;
+ 			assert((void*)image_resource_data_entry == import_resource_directory + 1);
+		}
+	}
 }
 
 STATIC INLINE PROCEDURE fatal(READONLY CHAR* what)
