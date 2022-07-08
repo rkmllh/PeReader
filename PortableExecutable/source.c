@@ -234,7 +234,6 @@ PROCEDURE ImageFileHeaders(READONLY IMAGE_FILE_HEADER* image_file_header)
 
 	printf("[+]Number of sections: 0x%x\n", image_file_header->NumberOfSections);
 
-
 	TIME(image_file_header->TimeDateStamp, "Linked data");
 
 	printf("[+]Pointer to symbol table: 0x%llx\n", (DWORD64)image_file_header->PointerToSymbolTable);
